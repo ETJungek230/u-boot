@@ -2125,9 +2125,84 @@ static int mmc_select_hs400es(struct mmc *mmc)
 	    ecbv++) \
 		if ((ddr == ecbv->is_ddr) && (caps & ecbv->cap))
 
+static void mmc_print_selected_timing(struct mmc *mmc)
+{
+	int devnum = mmc_get_blk_desc(mmc)->devnum;
+
+#if CONFIG_IS_ENABLED(MMC_VERBOSE) || defined(DEBUG) || \
+	CONFIG_VAL(LOGLEVEL) >= LOGL_DEBUG
+	printf("MMC%d: selected timing: %s, %u-bit, clock=%u Hz\n",
+	       devnum, mmc_mode_name(mmc->selected_mode), mmc->bus_width,
+	       mmc->clock);
+#else
+	printf("MMC%d: selected timing: mode=%u, %u-bit, clock=%u Hz\n",
+	       devnum, mmc->selected_mode, mmc->bus_width, mmc->clock);
+#endif
+}
+
+static int mmc_recover_mode_and_width(struct mmc *mmc,
+				      enum mmc_voltage signal_voltage)
+{
+	enum bus_mode safe_mode = MMC_LEGACY;
+	int err;
+
+	/*
+	 * A failed HS200/HS400 transfer may be unreliable at the selected
+	 * frequency. Slow the clock before asking the card to leave that mode.
+	 */
+	if (mmc->selected_mode == MMC_HS_200 ||
+	    mmc->selected_mode == MMC_HS_400 ||
+	    mmc->selected_mode == MMC_HS_400_ES) {
+		err = mmc_set_clock(mmc, mmc_mode2freq(mmc, MMC_HS), false);
+		if (err)
+			return err;
+
+		/* Do not read EXT_CSD until the failed bus width is replaced. */
+		err = __mmc_switch(mmc, EXT_CSD_CMD_SET_NORMAL,
+				   EXT_CSD_HS_TIMING, EXT_CSD_TIMING_HS, false);
+		if (err)
+			return err;
+
+		mmc_select_mode(mmc, MMC_HS);
+		err = mmc_set_clock(mmc, mmc_mode2freq(mmc, MMC_HS), false);
+		if (err)
+			return err;
+		safe_mode = MMC_HS;
+	} else if (mmc->selected_mode == MMC_HS ||
+		   mmc->selected_mode == MMC_HS_52 ||
+		   mmc->selected_mode == MMC_DDR_52) {
+		err = mmc_set_clock(mmc, mmc_mode2freq(mmc, MMC_HS), false);
+		if (err)
+			return err;
+		safe_mode = MMC_HS;
+	} else {
+		err = mmc_set_clock(mmc, mmc->legacy_speed, false);
+		if (err)
+			return err;
+	}
+
+	/* Change the card first, then apply the same width and timing to host. */
+	err = mmc_switch(mmc, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_BUS_WIDTH,
+			 EXT_CSD_BUS_WIDTH_1);
+	if (err)
+		return err;
+
+	mmc_select_mode(mmc, safe_mode);
+	err = mmc_set_bus_width(mmc, 1);
+	if (err)
+		return err;
+
+	err = mmc_set_clock(mmc, mmc_mode2freq(mmc, safe_mode), false);
+	if (err)
+		return err;
+
+	return mmc_set_signal_voltage(mmc, signal_voltage);
+}
+
 static int mmc_select_mode_and_width(struct mmc *mmc, uint card_caps)
 {
 	int err = 0;
+	int recover_err;
 	const struct mode_width_tuning *mwt;
 	const struct ext_csd_bus_width *ecbw;
 
@@ -2246,15 +2321,17 @@ static int mmc_select_mode_and_width(struct mmc *mmc, uint card_caps)
 
 			/* do a transfer to check the configuration */
 			err = mmc_read_and_compare_ext_csd(mmc);
-			if (!err)
+			if (!err) {
+				mmc_print_selected_timing(mmc);
 				return 0;
+			}
 error:
-			mmc_set_signal_voltage(mmc, old_voltage);
-			/* if an error occurred, revert to a safer bus mode */
-			mmc_switch(mmc, EXT_CSD_CMD_SET_NORMAL,
-				   EXT_CSD_BUS_WIDTH, EXT_CSD_BUS_WIDTH_1);
-			mmc_select_mode(mmc, MMC_LEGACY);
-			mmc_set_bus_width(mmc, 1);
+			recover_err = mmc_recover_mode_and_width(mmc, old_voltage);
+			if (recover_err) {
+				pr_err("failed to recover MMC mode: %d (original error: %d)\n",
+				       recover_err, err);
+				return recover_err;
+			}
 		}
 	}
 
@@ -2967,7 +3044,11 @@ int mmc_start_init(struct mmc *mmc)
 		}
 	}
 #if CONFIG_IS_ENABLED(DM_MMC)
-	mmc_deferred_probe(mmc);
+	err = mmc_deferred_probe(mmc);
+	if (err) {
+		pr_err("MMC: deferred probe failed: %d\n", err);
+		return err;
+	}
 #endif
 #if !defined(CONFIG_MMC_BROKEN_CD)
 	no_card = mmc_getcd(mmc) == 0;
