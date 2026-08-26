@@ -43,6 +43,10 @@ config TARGET_K230_CANMV_01STUDIO
 	bool "Support k230_CANMV(01STUDIO)"
 	select SYS_CACHE_SHIFT_6
 	
+config TARGET_K230_CANMV_ZEXIN
+	bool "Support k230_CANMV(ZEXIN)"
+	select SYS_CACHE_SHIFT_6
+
 config TARGET_K230_CANMV_HIWONDER 
 	bool "Support k230_CANMV(HiWonder)" 
 	select SYS_CACHE_SHIFT_6 
